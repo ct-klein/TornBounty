@@ -1,0 +1,22 @@
+{
+  "bounties_timestamp": 1773231230,
+  "bounties": [
+    {
+      "target_id": 1685702,
+      "target_name": "Bezee",
+      "target_level": 90,
+      "lister_id": null,
+      "lister_name": null,
+      "reward": 1500000,
+      "reason": "mission",
+      "quantity": 1,
+      "is_anonymous": true,
+      "valid_until": 1773832790
+    },
+  "_metadata": {
+    "links": {
+      "prev": null,
+      "next": "https://api.torn.com/v2/torn/bounties?&limit=100&offset=100"
+    }
+  }
+}
