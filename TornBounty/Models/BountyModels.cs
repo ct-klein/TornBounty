@@ -1,6 +1,26 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace TornBounty.Models;
+
+public sealed class FlexibleStringConverter : JsonConverter<string?>
+{
+    public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        return reader.TokenType switch
+        {
+            JsonTokenType.String => reader.GetString(),
+            JsonTokenType.Number => reader.GetInt64().ToString(),
+            JsonTokenType.Null => null,
+            _ => reader.GetString()
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, string? value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value);
+    }
+}
 
 public sealed class BountyResponse
 {
@@ -20,6 +40,7 @@ public sealed class Bounty
     public int TargetId { get; set; }
 
     [JsonPropertyName("target_name")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string? TargetName { get; set; }
 
     [JsonPropertyName("target_level")]
@@ -29,12 +50,14 @@ public sealed class Bounty
     public int? ListerId { get; set; }
 
     [JsonPropertyName("lister_name")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string? ListerName { get; set; }
 
     [JsonPropertyName("reward")]
     public long Reward { get; set; }
 
     [JsonPropertyName("reason")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string? Reason { get; set; }
 
     [JsonPropertyName("quantity")]
