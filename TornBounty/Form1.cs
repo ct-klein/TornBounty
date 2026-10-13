@@ -24,6 +24,12 @@ public partial class Form1 : Form
     private readonly Dictionary<int, int?> _statsTierCache = [];
     private string? _statusWarning;
 
+    // The grid is shown before status lookups finish, then refreshed at most this often as they come in
+    private static readonly TimeSpan GridRefreshInterval = TimeSpan.FromSeconds(1);
+    private string? _gridSummary;
+    private string? _statusProgress;
+    private DateTime? _rateLimitResumeLocal;
+
     public Form1()
     {
         InitializeComponent();
@@ -39,7 +45,15 @@ public partial class Form1 : Form
 
     private void OnRateLimitWaiting(TimeSpan wait)
     {
-        void Update() => lblStatus.Text = $"Pausing {Math.Ceiling(wait.TotalSeconds)}s to stay under Torn's API rate limit...";
+        void Update()
+        {
+            _rateLimitResumeLocal = DateTime.Now + wait;
+            // While status lookups run, the pause is shown alongside their progress instead
+            if (_statusProgress is null)
+                lblStatus.Text = $"Pausing {Math.Ceiling(wait.TotalSeconds)}s to stay under Torn's API rate limit...";
+            else
+                UpdateStatusLabel();
+        }
 
         if (InvokeRequired)
             BeginInvoke(Update);
@@ -100,7 +114,10 @@ public partial class Form1 : Form
         }
 
         _cts?.Cancel();
-        _cts = new CancellationTokenSource();
+        var cts = _cts = new CancellationTokenSource();
+        _statusWarning = null;
+        _statusProgress = null;
+        _rateLimitResumeLocal = null;
 
         SetLoadingState(true);
         try
@@ -117,8 +134,12 @@ public partial class Form1 : Form
             // The key worked, so remember it for next time
             ApiKeyStore.Save(txtApiKey.Text.Trim());
 
-            await LoadPlayerStatusesAsync(txtApiKey.Text.Trim(), _cts.Token);
+            // Show the page now; statuses and estimates fill in as the lookups complete
             BindGrid();
+            SetLoadingState(false);
+
+            await LoadPlayerStatusesAsync(txtApiKey.Text.Trim(), cts.Token);
+            BindGrid(keepGridPosition: true);
         }
         catch (OperationCanceledException)
         {
@@ -139,13 +160,14 @@ public partial class Form1 : Form
         }
         finally
         {
-            SetLoadingState(false);
+            // A newer fetch may have started (and cancelled this one); leave its loading state alone
+            if (cts == _cts)
+                SetLoadingState(false);
         }
     }
 
     private async Task LoadPlayerStatusesAsync(string apiKey, CancellationToken cancellationToken)
     {
-        _statusWarning = null;
         var now = DateTime.UtcNow;
         var targetIds = _currentBounties
             .Select(b => b.TargetId)
@@ -161,6 +183,9 @@ public partial class Form1 : Form
         using var throttle = new SemaphoreSlim(MaxConcurrentStatusRequests);
         var completed = 0;
         var failed = 0;
+        var sinceRefresh = Stopwatch.StartNew();
+        _statusProgress = $"Checking player status 0/{targetIds.Count}";
+        UpdateStatusLabel();
 
         async Task LoadOneAsync(int userId)
         {
@@ -186,7 +211,21 @@ public partial class Form1 : Form
             {
                 throttle.Release();
                 completed++;
-                lblStatus.Text = $"Checking player status {completed}/{targetIds.Count}...";
+
+                // Once a newer fetch has started, the grid and label belong to it
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    _statusProgress = $"Checking player status {completed}/{targetIds.Count}";
+                    if (sinceRefresh.Elapsed >= GridRefreshInterval)
+                    {
+                        BindGrid(keepGridPosition: true);
+                        sinceRefresh.Restart();
+                    }
+                    else
+                    {
+                        UpdateStatusLabel();
+                    }
+                }
             }
         }
 
@@ -199,6 +238,8 @@ public partial class Form1 : Form
             // Stopped early due to rate limit; _statusWarning is already set
         }
 
+        _statusProgress = null;
+        _rateLimitResumeLocal = null;
         if (_statusWarning is null && failed > 0)
             _statusWarning = $"{failed} status lookup(s) failed";
     }
@@ -244,8 +285,14 @@ public partial class Form1 : Form
         cboMaxStats.SelectedIndex = 0;
     }
 
-    private void BindGrid()
+    // keepGridPosition restores the scroll position and selected target after rebinding,
+    // so background refreshes don't jump the grid back to the top
+    private void BindGrid(bool keepGridPosition = false)
     {
+        var firstDisplayedRow = dgvBounties.FirstDisplayedScrollingRowIndex;
+        var selectedTargetId = dgvBounties.CurrentRow?.Cells["TargetId"].Value as int?;
+        var selectedColumn = dgvBounties.CurrentCell?.ColumnIndex ?? 0;
+
         var minLevel = (int)nudMinLevel.Value;
         var maxLevel = (int)nudMaxLevel.Value;
         var filtered = _currentBounties
@@ -297,19 +344,56 @@ public partial class Form1 : Form
 
         dgvBounties.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.AllCells);
 
+        if (keepGridPosition)
+            RestoreGridPosition(firstDisplayedRow, selectedTargetId, selectedColumn);
+
         if (_bountiesTimestamp > 0)
         {
             var timestamp = DateTimeOffset.FromUnixTimeSeconds(_bountiesTimestamp).LocalDateTime.ToString("g");
-            var status = $"Showing {filtered.Count} of {_currentBounties.Count}";
+            var summary = $"Showing {filtered.Count} of {_currentBounties.Count}";
             if (notOkayCount > 0)
-                status += $" ({notOkayCount} not Okay hidden)";
+                summary += $" ({notOkayCount} not Okay hidden)";
             if (overStatsCount > 0)
-                status += $" ({overStatsCount} over stats limit hidden)";
-            status += $"  |  Timestamp: {timestamp}";
-            if (_statusWarning is not null)
-                status += $"  |  {_statusWarning}";
-            lblStatus.Text = status;
+                summary += $" ({overStatsCount} over stats limit hidden)";
+            _gridSummary = summary + $"  |  Timestamp: {timestamp}";
+            UpdateStatusLabel();
         }
+    }
+
+    private void RestoreGridPosition(int firstDisplayedRow, int? selectedTargetId, int selectedColumn)
+    {
+        // Setting CurrentCell scrolls it into view, so restore the selection before the scroll position
+        if (selectedTargetId is not null)
+        {
+            foreach (DataGridViewRow row in dgvBounties.Rows)
+            {
+                if (row.Cells["TargetId"].Value as int? == selectedTargetId)
+                {
+                    dgvBounties.CurrentCell = row.Cells[Math.Min(selectedColumn, row.Cells.Count - 1)];
+                    break;
+                }
+            }
+        }
+
+        if (firstDisplayedRow >= 0 && firstDisplayedRow < dgvBounties.RowCount)
+            dgvBounties.FirstDisplayedScrollingRowIndex = firstDisplayedRow;
+    }
+
+    private void UpdateStatusLabel()
+    {
+        if (_gridSummary is null)
+            return;
+
+        var text = _gridSummary;
+        if (_statusProgress is not null)
+        {
+            text += $"  |  {_statusProgress}...";
+            if (_rateLimitResumeLocal is { } resume && resume > DateTime.Now)
+                text += $" (paused for API rate limit until {resume:T})";
+        }
+        if (_statusWarning is not null)
+            text += $"  |  {_statusWarning}";
+        lblStatus.Text = text;
     }
 
     private void SetColumnHeader(string columnName, string headerText)
@@ -389,6 +473,41 @@ public partial class Form1 : Form
             }
             BindGrid();
         }
+        else if (columnName == "Status")
+        {
+            // Unknown statuses sort last in both directions
+            var tag = dgvBounties.Columns[e.ColumnIndex].Tag as string;
+            if (tag == "asc")
+            {
+                _currentBounties = [.. _currentBounties
+                    .OrderBy(b => GetStatusSortKey(b.TargetId).Rank == StatusRankUnknown)
+                    .ThenByDescending(b => GetStatusSortKey(b.TargetId))];
+                dgvBounties.Columns[e.ColumnIndex].Tag = "desc";
+            }
+            else
+            {
+                _currentBounties = [.. _currentBounties.OrderBy(b => GetStatusSortKey(b.TargetId))];
+                dgvBounties.Columns[e.ColumnIndex].Tag = "asc";
+            }
+            BindGrid();
+        }
+    }
+
+    private const int StatusRankUnknown = 3;
+
+    // Ascending order: Okay first, then timed states (hospital/jail) by soonest release,
+    // then untimed states (traveling, abroad, ...) by name, then unknown
+    private (int Rank, long Until, string State) GetStatusSortKey(int targetId)
+    {
+        if (!_statusCache.TryGetValue(targetId, out var cached))
+            return (StatusRankUnknown, 0, "");
+
+        var status = cached.Status;
+        if (status.IsOkay)
+            return (0, 0, "");
+        if (status.Until > 0)
+            return (1, status.Until.Value, "");
+        return (2, 0, status.State ?? "");
     }
 
     private void SetLoadingState(bool loading)

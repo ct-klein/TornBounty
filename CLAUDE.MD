@@ -43,4 +43,4 @@ dotnet run
 - Use async/await with CancellationToken for API calls
 - Handle nullable references properly (nullable enabled)
 - Keep UI responsive: disable controls during loading, show status messages
-- Sort by clicking column headers (target_level and reward columns supported)
+- Sort by clicking column headers (Level, Status, Est. Stats and Reward columns supported)
